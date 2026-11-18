@@ -26,7 +26,7 @@ def main(ckpt_path="runs/best.pt", out_dir="runs"):
         torch.onnx.export(
             wrapper, dummy, onnx_path,
             input_names=["input"], output_names=["detections"],
-            opset_version=12, dynamic_axes=None, dynamo=False,
+            opset_version=12, dynamic_axes=None,
         )
     size = os.path.getsize(onnx_path)
     print(f"ONNX exported: {onnx_path} ({size:,} bytes)")

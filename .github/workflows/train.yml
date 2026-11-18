@@ -45,6 +45,7 @@ jobs:
 
       - name: Train
         run: |
+          set -o pipefail
           mkdir -p runs
           if [ "${{ inputs.smoke }}" = "true" ]; then
             python -u train.py --epochs ${{ inputs.epochs }} --limit-train 480 2>&1 | tee runs/train.log
@@ -53,7 +54,9 @@ jobs:
           fi
 
       - name: Export ONNX
-        run: python export.py 2>&1 | tee -a runs/train.log
+        run: |
+          set -o pipefail
+          python export.py 2>&1 | tee -a runs/train.log
 
       - name: Predict on sample val images
         run: |

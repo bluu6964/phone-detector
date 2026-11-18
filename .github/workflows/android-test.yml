@@ -21,11 +21,13 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
+      # ubuntu-latest runners ship an Android SDK (ANDROID_HOME); the
+      # setup-android action is incompatible with its cmdline-tools 16.0,
+      # so install the needed packages with the preinstalled sdkmanager.
       - name: Install SDK platform 34 + build-tools
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0"
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Build debug APK
         working-directory: android-test-app

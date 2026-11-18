@@ -60,10 +60,26 @@ python predict.py --model runs/best.onnx --src some_images/ --out predictions/
 
 ## RESULTS
 
-Smoke run (pipeline check — numbers below are plumbing measurements, not
-model quality; a 2-epoch smoke model is expected to score near zero):
+Smoke run (pipeline check — plumbing measurements, not model quality;
+a 2-epoch smoke model is expected to score near zero).
+GitHub Actions run 44257243563, 2026-11-18 — **fully green**:
 
-- _To be filled in after the first smoke run._
+- Dataset (smoke cap): 600 images downloaded, 0 failures —
+  461 positives + 139 negatives; split: train 540 (415 pos / 125 neg),
+  val 60 (46 pos / 14 neg). Training used a 480-image train limit.
+- Parameters: **1,059,626 (1.06M)** — inside the 0.8M–1.2M budget.
+- Speed on the GitHub runner: **~52 s/epoch** (480 images, batch 32,
+  incl. val eval) → ~3.2 s/step.
+- Loss fell 8.71 → 7.28 over the 2 epochs; val mAP@0.5 = 0.0000
+  (expected after 2 epochs — plumbing only).
+- Export: `best.onnx` = **4,234,342 bytes (~4.0 MB)**, runtime-verified,
+  output shape (500, 5). TFLite skipped (onnx→tf chain not installed;
+  ONNX is the supported artifact, `predict.py` runs it via ONNXRuntime).
+- Artifact `phone-detector-run`: best.onnx, best.pt (4,331,034 bytes),
+  metrics.json, manifest.json, train.log, results.txt, 8 annotated
+  sample images (no detections at conf 0.25 — expected for smoke).
 
-Full training run (60 epochs): **pending** — will be dispatched after the
-smoke numbers are reviewed.
+Full training run: **pending**. COCO holds ~2,750 phone images in total,
+so the full dataset will be ~3,575 images (~3,220 train). At the measured
+~3.2 s/step that is ~5.7 min/epoch → 60 epochs ≈ 340 min, right at the
+350-min job cap; **recommended first full run: 50 epochs (~285 min)**.

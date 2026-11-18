@@ -7,4 +7,5 @@ artifact_out/
 __pycache__/
 *.pt
 *.onnx
+!android-test-app/app/src/main/assets/*.onnx
 *.tflite

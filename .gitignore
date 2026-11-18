@@ -9,3 +9,7 @@ __pycache__/
 *.onnx
 !android-test-app/app/src/main/assets/*.onnx
 *.tflite
+data_v2/
+data_v2_src/
+data_v2_stage/
+data_v2.tar.part-*

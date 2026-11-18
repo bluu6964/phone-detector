@@ -1,0 +1,93 @@
+name: train-phone-detector-v2
+
+# Chained v2 training: each dispatch restores last.pt/best.pt from the
+# `ckpt-v2` release, trains toward the TOTAL target epochs (train.py
+# --resume semantics), then uploads the updated checkpoints back.
+# Re-dispatching this workflow continues training where the last job stopped.
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "TOTAL target epochs (not additional)"
+        required: true
+        default: "12"
+      probe:
+        description: "Timing probe only: 300 steps, no checkpoints written"
+        type: boolean
+        default: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install pillow==10.4.0 numpy==1.26.4
+
+      - name: Download v2 dataset pack (release data-v2)
+        run: |
+          mkdir -p pack
+          gh release download data-v2 --pattern 'data_v2.tar.part-*' --dir pack
+          cat pack/data_v2.tar.part-* | tar -xf - -C .
+          rm -rf pack
+          test -f data_v2/manifest.json
+          echo "train images: $(ls data_v2/images/train | wc -l)"
+          echo "val images:   $(ls data_v2/images/val | wc -l)"
+          cat data_v2/manifest.json
+
+      - name: Restore checkpoint from release ckpt-v2 (if any)
+        if: ${{ !inputs.probe }}
+        run: |
+          mkdir -p runs
+          gh release download ckpt-v2 --pattern 'last.pt' --dir runs || echo "no last.pt yet (fresh start)"
+          gh release download ckpt-v2 --pattern 'best.pt' --dir runs || echo "no best.pt yet (fresh start)"
+          ls -la runs || true
+
+      - name: Timing probe (300 steps)
+        if: ${{ inputs.probe }}
+        run: |
+          python train.py --data data_v2 --epochs 12 --max-steps 300 \
+            --workers 4 --out runs 2>&1 | tee train_v2.log
+
+      - name: Train toward target epochs (resumable)
+        if: ${{ !inputs.probe }}
+        run: |
+          python train.py --data data_v2 --epochs ${{ inputs.epochs }} \
+            --resume --workers 4 --out runs 2>&1 | tee train_v2.log
+
+      - name: Upload checkpoints back to release ckpt-v2
+        if: ${{ always() && !inputs.probe }}
+        run: |
+          if [ -f runs/last.pt ]; then
+            gh release view ckpt-v2 > /dev/null 2>&1 || \
+              gh release create ckpt-v2 --title "Phone detector v2 checkpoints" \
+                --notes "Rolling last.pt / best.pt for chained train-v2 runs. Managed by .github/workflows/train-v2.yml."
+            gh release upload ckpt-v2 runs/last.pt --clobber
+            [ -f runs/best.pt ] && gh release upload ckpt-v2 runs/best.pt --clobber || true
+            echo "checkpoints uploaded"
+          else
+            echo "no runs/last.pt to upload"
+          fi
+
+      - name: Upload run artifact (metrics + log)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phone-detector-v2-run
+          path: |
+            runs/metrics.json
+            train_v2.log
+          if-no-files-found: warn

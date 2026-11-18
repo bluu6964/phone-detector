@@ -45,7 +45,8 @@ def letterbox(img, boxes, size=IMG_SIZE):
 
 
 class PhoneDataset(Dataset):
-    def __init__(self, root, split, augment=False, limit=None, seed=42):
+    def __init__(self, root, split, augment=False, limit=None, seed=42,
+                 paste_prob=0.3):
         self.img_dir = os.path.join(root, "images", split)
         self.lbl_dir = os.path.join(root, "labels", split)
         self.files = sorted(f for f in os.listdir(self.img_dir) if f.endswith(".jpg"))
@@ -55,6 +56,14 @@ class PhoneDataset(Dataset):
             self.files = self.files[:limit]
         self.augment = augment
         self.rng = random.Random(seed + (1 if augment else 0))
+        # Copy-paste donors: files that contain at least one phone box.
+        self.paste_prob = paste_prob if augment else 0.0
+        self.donors = []
+        if self.paste_prob > 0:
+            for name in self.files:
+                path = os.path.join(self.lbl_dir, name.replace(".jpg", ".txt"))
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    self.donors.append(name)
 
     def __len__(self):
         return len(self.files)
@@ -102,6 +111,8 @@ class PhoneDataset(Dataset):
             if rng.random() < 0.5:  # brightness / contrast
                 img = ImageEnhance.Brightness(img).enhance(rng.uniform(0.7, 1.3))
                 img = ImageEnhance.Contrast(img).enhance(rng.uniform(0.7, 1.3))
+        if self.paste_prob > 0 and self.donors and rng.random() < self.paste_prob:
+            img, boxes = self._copy_paste(img, boxes, rng)
         if len(boxes):
             boxes[:, [0, 2]] = boxes[:, [0, 2]].clip(0, IMG_SIZE)
             boxes[:, [1, 3]] = boxes[:, [1, 3]].clip(0, IMG_SIZE)
@@ -110,6 +121,41 @@ class PhoneDataset(Dataset):
         arr = np.asarray(img, dtype=np.float32) / 255.0
         tensor = torch.from_numpy(arr).permute(2, 0, 1)
         return tensor, torch.from_numpy(boxes)
+
+
+    def _copy_paste(self, img, boxes, rng):
+        """Paste a phone crop from a random donor image onto this canvas
+        (both already letterboxed to IMG_SIZE); append the pasted box."""
+        try:
+            dname = rng.choice(self.donors)
+            dimg = Image.open(os.path.join(self.img_dir, dname)).convert("RGB")
+            dw, dh = dimg.size
+            dboxes = self._load_boxes(dname, dw, dh)
+            if len(dboxes) == 0:
+                return img, boxes
+            dimg, dboxes, _, _, _ = letterbox(dimg, dboxes)
+            b = dboxes[rng.randrange(len(dboxes))]
+            x0, y0, x1, y1 = (int(round(v)) for v in b)
+            mx, my = 2, 2
+            x0, y0 = max(0, x0 - mx), max(0, y0 - my)
+            x1, y1 = min(IMG_SIZE, x1 + mx), min(IMG_SIZE, y1 + my)
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                return img, boxes
+            crop = dimg.crop((x0, y0, x1, y1))
+            scale = rng.uniform(0.5, 1.5)
+            nw = max(8, int(crop.width * scale))
+            nh = max(8, int(crop.height * scale))
+            if nw >= IMG_SIZE or nh >= IMG_SIZE:
+                return img, boxes
+            crop = crop.resize((nw, nh), Image.BILINEAR)
+            px = rng.randint(0, IMG_SIZE - nw)
+            py = rng.randint(0, IMG_SIZE - nh)
+            img.paste(crop, (px, py))
+            new_box = np.array([[px, py, px + nw, py + nh]], dtype=np.float32)
+            boxes = np.concatenate([boxes, new_box], axis=0) if len(boxes) else new_box
+            return img, boxes
+        except Exception:  # noqa: BLE001 - augmentation must never break training
+            return img, boxes
 
 
 def collate(batch):
@@ -222,6 +268,16 @@ def main():
     ap.add_argument("--limit-train", type=int, default=None)
     ap.add_argument("--eval-limit", type=int, default=256)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from <out>/last.pt if it exists; --epochs is "
+                         "the TOTAL target epoch count, not additional epochs")
+    ap.add_argument("--max-steps", type=int, default=None,
+                    help="stop after N optimizer steps (timing probe mode; "
+                         "no checkpoints or metrics are written)")
+    ap.add_argument("--save-every-min", type=float, default=30.0,
+                    help="also save last.pt at least this often (wall time)")
+    ap.add_argument("--paste-prob", type=float, default=0.3,
+                    help="copy-paste augmentation probability (train split)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -237,7 +293,8 @@ def main():
         print("WARNING: parameter count outside 0.8M-1.2M target", flush=True)
 
     train_ds = PhoneDataset(args.data, "train", augment=True,
-                            limit=args.limit_train, seed=args.seed)
+                            limit=args.limit_train, seed=args.seed,
+                            paste_prob=args.paste_prob)
     val_ds = PhoneDataset(args.data, "val", augment=False, seed=args.seed)
     print(f"Train images: {len(train_ds)}  Val images: {len(val_ds)}", flush=True)
     loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
@@ -248,12 +305,54 @@ def main():
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=max(1, args.epochs))
 
-    history = []
+    # ---- resume state -----------------------------------------------------
+    start_epoch = 0
     best_map = -1.0
-    for epoch in range(args.epochs):
+    history = []
+    last_path = os.path.join(args.out, "last.pt")
+    if args.resume and os.path.exists(last_path):
+        ckpt = torch.load(last_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        if "opt" in ckpt:
+            opt.load_state_dict(ckpt["opt"])
+        if "sched" in ckpt:
+            sched.load_state_dict(ckpt["sched"])
+        else:  # v1 checkpoint: fast-forward the cosine schedule manually
+            for _ in range(int(ckpt.get("epoch", 0))):
+                sched.step()
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_map = float(ckpt.get("best_map", ckpt.get("val_map50", -1.0)))
+        history = ckpt.get("history", [])
+        print(f"Resumed from {last_path}: completed epochs={start_epoch}, "
+              f"best_val_mAP50={best_map:.4f}", flush=True)
+    if start_epoch >= args.epochs and not args.max_steps:
+        print(f"Already at target: {start_epoch} >= {args.epochs} epochs. "
+              "Nothing to do.", flush=True)
+        return
+
+    def save_last(completed_epochs, val_map):
+        torch.save({"model": model.state_dict(), "opt": opt.state_dict(),
+                    "sched": sched.state_dict(), "epoch": completed_epochs,
+                    "val_map50": val_map, "best_map": best_map,
+                    "params": n_params, "history": history}, last_path)
+
+    def write_metrics(final_map=None):
+        metrics = {"params": n_params, "params_m": round(n_params / 1e6, 3),
+                   "epochs": args.epochs,
+                   "completed_epochs": history[-1]["epoch"] if history else start_epoch,
+                   "best_val_map50": best_map, "history": history}
+        if final_map is not None:
+            metrics["final_val_map50_full"] = final_map
+        with open(os.path.join(args.out, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+
+    probe = args.max_steps is not None
+    last_save = time.time()
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         t0 = time.time()
         run_loss, run_obj, run_box, run_iou, steps = 0.0, 0.0, 0.0, 0.0, 0
+        imgs_seen = 0
         for imgs, boxes in loader:
             imgs = imgs.to(device)
             targets = build_targets(boxes, device)
@@ -265,31 +364,45 @@ def main():
             opt.step()
             run_loss += float(loss); run_obj += lo; run_box += lb; run_iou += li
             steps += 1
+            imgs_seen += int(imgs.shape[0])
+            if probe and steps >= args.max_steps:
+                dt = time.time() - t0
+                print(f"PROBE steps={steps} seconds={dt:.1f} "
+                      f"s_per_step={dt / steps:.3f} "
+                      f"img_per_sec={imgs_seen / dt:.1f} "
+                      f"steps_per_epoch={len(loader)}", flush=True)
+                return
+            if not probe and (time.time() - last_save) > args.save_every_min * 60:
+                save_last(epoch, history[-1]["val_map50"] if history else -1.0)
+                last_save = time.time()
+                print(f"  [periodic save] last.pt at epoch-in-progress "
+                      f"{epoch + 1}", flush=True)
         sched.step()
+        dt_train = time.time() - t0
         val_map = evaluate_map50(model, val_ds, device, limit=args.eval_limit)
         dt = time.time() - t0
         rec = {"epoch": epoch + 1, "loss": run_loss / max(1, steps),
                "obj": run_obj / max(1, steps), "box": run_box / max(1, steps),
                "iou_loss": run_iou / max(1, steps), "val_map50": val_map,
-               "seconds": round(dt, 1)}
+               "seconds": round(dt, 1), "steps": steps,
+               "img_per_sec": round(imgs_seen / max(dt_train, 1e-9), 1)}
         history.append(rec)
         print(f"epoch {epoch + 1}/{args.epochs} loss={rec['loss']:.4f} "
               f"obj={rec['obj']:.4f} box={rec['box']:.4f} iou={rec['iou_loss']:.4f} "
-              f"val_mAP50={val_map:.4f} ({dt:.0f}s)", flush=True)
-        ckpt = {"model": model.state_dict(), "epoch": epoch + 1,
-                "val_map50": val_map, "params": n_params}
-        torch.save(ckpt, os.path.join(args.out, "last.pt"))
+              f"val_mAP50={val_map:.4f} ({dt:.0f}s, "
+              f"{rec['img_per_sec']:.0f} img/s)", flush=True)
         if val_map >= best_map:
             best_map = val_map
-            torch.save(ckpt, os.path.join(args.out, "best.pt"))
+            torch.save({"model": model.state_dict(), "epoch": epoch + 1,
+                        "val_map50": val_map, "params": n_params},
+                       os.path.join(args.out, "best.pt"))
+        save_last(epoch + 1, val_map)
+        last_save = time.time()
+        write_metrics()
 
     final_map = evaluate_map50(model, val_ds, device, limit=None)
     print(f"Final val mAP@0.5 (full val set): {final_map:.4f}", flush=True)
-    metrics = {"params": n_params, "params_m": round(n_params / 1e6, 3),
-               "epochs": args.epochs, "best_val_map50": best_map,
-               "final_val_map50_full": final_map, "history": history}
-    with open(os.path.join(args.out, "metrics.json"), "w") as f:
-        json.dump(metrics, f, indent=2)
+    write_metrics(final_map=final_map)
     print("Wrote runs/metrics.json", flush=True)
 
 

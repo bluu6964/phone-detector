@@ -25,8 +25,10 @@ import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-ANN_URL = "https://images.cocodataset.org/annotations/annotations_trainval2017.zip"
-IMG_BASE = "https://images.cocodataset.org"
+# NOTE: plain http on purpose - images.cocodataset.org serves a certificate
+# whose hostname does not match, which breaks urllib's SSL verification.
+ANN_URL = "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+IMG_BASE = "http://images.cocodataset.org"
 NEG_CATEGORIES = ("person", "laptop", "remote", "book")
 DATA_DIR = "data"
 

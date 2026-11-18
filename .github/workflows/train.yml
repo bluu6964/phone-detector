@@ -1,0 +1,80 @@
+name: train-phone-detector
+
+on:
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Training epochs"
+        required: true
+        default: "60"
+      smoke:
+        description: "Smoke run (small data subset, pipeline check)"
+        type: boolean
+        default: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies (CPU torch)
+        run: |
+          pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cpu
+          pip install onnx==1.16.1 onnxruntime==1.18.0 pillow==10.4.0 numpy==1.26.4
+
+      - name: Cache dataset
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: coco-phone-data-v1-${{ inputs.smoke }}
+
+      - name: Prepare data (COCO)
+        run: |
+          if [ "${{ inputs.smoke }}" = "true" ]; then
+            python data_prep.py --smoke
+          else
+            python data_prep.py
+          fi
+
+      - name: Train
+        run: |
+          mkdir -p runs
+          if [ "${{ inputs.smoke }}" = "true" ]; then
+            python -u train.py --epochs ${{ inputs.epochs }} --limit-train 480 2>&1 | tee runs/train.log
+          else
+            python -u train.py --epochs ${{ inputs.epochs }} 2>&1 | tee runs/train.log
+          fi
+
+      - name: Export ONNX
+        run: python export.py 2>&1 | tee -a runs/train.log
+
+      - name: Predict on sample val images
+        run: |
+          mkdir -p samples_in samples_out
+          ls data/images/val/*.jpg | head -8 | xargs -I{} cp {} samples_in/
+          python predict.py --model runs/best.onnx --src samples_in --out samples_out --conf 0.25
+
+      - name: Collect artifact files
+        run: |
+          mkdir -p artifact_out
+          cp runs/best.onnx artifact_out/
+          cp runs/best.pt artifact_out/ || true
+          cp runs/metrics.json artifact_out/
+          cp runs/train.log artifact_out/
+          cp data/manifest.json artifact_out/ || true
+          cp samples_out/results.txt artifact_out/ || true
+          cp samples_out/*.jpg artifact_out/ || true
+          ls -la artifact_out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: phone-detector-run
+          path: artifact_out/
+          if-no-files-found: error

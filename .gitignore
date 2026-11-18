@@ -1,0 +1,10 @@
+data/
+runs/
+samples_in/
+samples_out/
+predictions/
+artifact_out/
+__pycache__/
+*.pt
+*.onnx
+*.tflite

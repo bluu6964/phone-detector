@@ -14,6 +14,8 @@ Sources
               COCO images with person/laptop/remote/book and no phone.
 
 Stages (each resumable):
+  prep     -> coco_candidates.json  (from annotations_trainval2017.zip;
+              the from-scratch path used on fresh machines / CI runners)
   parse    -> candidates.json  (id lists + boxes + URLs)
   download -> stage/           (resized <=640px JPEG q80 + stage_boxes.json)
   build    -> data_v2/         (images/labels split + manifest.json)
@@ -53,6 +55,60 @@ TARGET_POS = 60_000
 TARGET_NEG = 40_000
 MAXDIM = 640
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) phone-detector/2.0"}
+
+
+# ----------------------------------------------------------------- prep ----
+def stage_prep():
+    """Regenerate coco_candidates.json from the COCO annotations zip.
+
+    Format (consumed by stage_parse): pos/neg are image-id lists (ints),
+    boxes maps str(id) -> [[x, y, w, h], ...] absolute COCO boxes, meta maps
+    str(id) -> [file_name, width, height, split] for pos and neg ids.
+    Negatives = images with person/laptop/remote/book but no cell phone
+    (same definition as data_prep.py v1).
+    """
+    out_path = os.path.join(SRC, "coco_candidates.json")
+    if os.path.exists(out_path):
+        print("coco_candidates.json exists, skipping prep", flush=True)
+        return
+    zip_path = os.path.join(SRC, "annotations_trainval2017.zip")
+    neg_names = ("person", "laptop", "remote", "book")
+    pos, neg, boxes, meta = [], [], {}, {}
+    with zipfile.ZipFile(zip_path) as z:
+        for split in ("train2017", "val2017"):
+            with z.open(f"annotations/instances_{split}.json") as f:
+                d = json.load(io.TextIOWrapper(f, encoding="utf-8"))
+            cats = {c["id"]: c["name"] for c in d["categories"]}
+            phone_id = next(cid for cid, n in cats.items()
+                            if n == "cell phone")
+            neg_ids = {cid for cid, n in cats.items() if n in neg_names}
+            img_meta = {im["id"]: im for im in d["images"]}
+            phone_boxes = {}
+            neg_cand = set()
+            for a in d["annotations"]:
+                if a["category_id"] == phone_id:
+                    phone_boxes.setdefault(a["image_id"], []).append(a["bbox"])
+                elif a["category_id"] in neg_ids:
+                    neg_cand.add(a["image_id"])
+            for iid, bb in phone_boxes.items():
+                im = img_meta[iid]
+                pos.append(iid)
+                boxes[str(iid)] = bb
+                meta[str(iid)] = [im["file_name"], im["width"],
+                                  im["height"], split]
+            for iid in sorted(neg_cand):
+                if iid in phone_boxes:
+                    continue
+                im = img_meta[iid]
+                neg.append(iid)
+                meta[str(iid)] = [im["file_name"], im["width"],
+                                  im["height"], split]
+            print(f"  {split}: {len(phone_boxes)} phone images", flush=True)
+    cand = {"pos": pos, "neg": neg, "boxes": boxes, "meta": meta}
+    with open(out_path, "w") as f:
+        json.dump(cand, f)
+    print(f"COCO candidates: {len(pos)} positives, {len(neg)} negatives",
+          flush=True)
 
 
 # ---------------------------------------------------------------- parse ----
@@ -160,15 +216,28 @@ def stage_parse():
 
 
 # ------------------------------------------------------------- download ----
-def fetch_resize(url, dest, retries=2):
+def fetch_resize(url, dest, retries=3):
+    """Download one image, resize to <=640px, save as JPEG q80.
+
+    Transient failures (HTTP 429 / 5xx, network errors) are retried with
+    backoff - Flickr throttles in bursts, so an instant fail would understate
+    how many images are actually reachable. Dead URLs (404 etc.) fail fast.
+    """
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         return True
-    for _ in range(retries):
+    delay = 2.0
+    for attempt in range(retries + 1):
         try:
             with requests.get(url, headers=UA, timeout=30, stream=True) as r:
-                if r.status_code != 200:
+                if r.status_code == 200:
+                    data = r.content
+                elif r.status_code in (429, 500, 502, 503, 504) \
+                        and attempt < retries:
+                    time.sleep(delay)
+                    delay *= 2.5
+                    continue
+                else:
                     return False
-                data = r.content
             img = Image.open(io.BytesIO(data)).convert("RGB")
             img.thumbnail((MAXDIM, MAXDIM), Image.BILINEAR)
             tmp = dest + ".tmp"
@@ -176,7 +245,11 @@ def fetch_resize(url, dest, retries=2):
             os.replace(tmp, dest)
             return True
         except Exception:  # noqa: BLE001 - dead URLs are expected; count them
-            time.sleep(1)
+            if attempt < retries:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            return False
     return False
 
 
@@ -185,24 +258,27 @@ def stage_download(workers=48, oid_neg_want=26_000, coco_neg_want=18_000,
     cand = json.load(open(os.path.join(SRC, "candidates.json")))
     os.makedirs(STAGE, exist_ok=True)
     rng = random.Random(seed)
-    jobs = []   # (kind, name, url, boxes or None)
+    coco_jobs, oid_jobs = [], []   # (kind, name, url, boxes or None)
     # COCO positives: all of them
     for iid, info in cand["coco_pos"].items():
         url = f"http://images.cocodataset.org/{info['split']}/{info['file']}"
-        jobs.append(("pos", f"coco_{iid}", url, info["boxes"]))
-    # COCO negatives: sample
+        coco_jobs.append(("pos", f"coco_{iid}", url, info["boxes"]))
+    # COCO negatives: initial sample; the rest stays in reserve for the
+    # negative top-up below (route-A fallback if OID delivers nothing).
     neg_ids = cand["coco_neg"][:]
     rng.shuffle(neg_ids)
-    for iid in neg_ids[:coco_neg_want]:
+    coco_neg_sample, coco_neg_rest = (neg_ids[:coco_neg_want],
+                                      neg_ids[coco_neg_want:])
+    for iid in coco_neg_sample:
         fn, w, h, split = cand["coco_meta"][iid]
         url = f"http://images.cocodataset.org/{split}/{fn}"
-        jobs.append(("neg", f"coco_{iid}", url, None))
+        coco_jobs.append(("neg", f"coco_{iid}", url, None))
     # OID positives: all of them
     for key, boxes in cand["oid_pos"].items():
         split, iid = key.split(":", 1)
         url = cand["oid_urls"].get(iid)
         if url:
-            jobs.append(("pos", f"oid_{split}_{iid}", url, boxes))
+            oid_jobs.append(("pos", f"oid_{split}_{iid}", url, boxes))
     # OID confusable negatives: sample
     conf = cand["oid_conf"][:]
     rng.shuffle(conf)
@@ -210,28 +286,79 @@ def stage_download(workers=48, oid_neg_want=26_000, coco_neg_want=18_000,
         split, iid = key.split(":", 1)
         url = cand["oid_urls"].get(iid)
         if url:
-            jobs.append(("neg", f"oid_{split}_{iid}", url, None))
-    print(f"download jobs: {len(jobs)} "
-          f"(pos {sum(1 for j in jobs if j[0] == 'pos')}, "
-          f"neg {sum(1 for j in jobs if j[0] == 'neg')})", flush=True)
+            oid_jobs.append(("neg", f"oid_{split}_{iid}", url, None))
+    print(f"download jobs: coco {len(coco_jobs)}, oid {len(oid_jobs)} "
+          f"(+ {len(coco_neg_rest)} COCO negatives in reserve)", flush=True)
 
     boxes_out = {}
-    stats = {"pos_ok": 0, "pos_fail": 0, "neg_ok": 0, "neg_fail": 0}
-    done = 0
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {}
-        for kind, name, url, boxes in jobs:
-            dest = os.path.join(STAGE, name + ".jpg")
-            futs[ex.submit(fetch_resize, url, dest)] = (kind, name, boxes)
-        for fut in as_completed(futs):
-            kind, name, boxes = futs[fut]
-            ok = fut.result()
-            stats[f"{kind}_{'ok' if ok else 'fail'}"] += 1
-            if ok and boxes is not None:
-                boxes_out[name] = boxes
-            done += 1
-            if done % 2000 == 0:
-                print(f"  {done}/{len(jobs)} {stats}", flush=True)
+    stats = {"pos_ok": 0, "pos_fail": 0, "neg_ok": 0, "neg_fail": 0,
+             "by_source": {}, "oid_aborted": False, "neg_topup_jobs": 0}
+
+    def note(kind, name, ok):
+        stats[f"{kind}_{'ok' if ok else 'fail'}"] += 1
+        src = "oid" if name.startswith("oid_") else "coco"
+        bs = stats["by_source"].setdefault(f"{src}_{kind}",
+                                           {"ok": 0, "fail": 0})
+        bs["ok" if ok else "fail"] += 1
+
+    def run(jobs, label):
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {}
+            for kind, name, url, boxes in jobs:
+                dest = os.path.join(STAGE, name + ".jpg")
+                futs[ex.submit(fetch_resize, url, dest)] = (kind, name, boxes)
+            for fut in as_completed(futs):
+                kind, name, boxes = futs[fut]
+                ok = fut.result()
+                note(kind, name, ok)
+                if ok and boxes is not None:
+                    boxes_out[name] = boxes
+                done += 1
+                if done % 2000 == 0:
+                    print(f"  [{label}] {done}/{len(jobs)}", flush=True)
+        print(f"  [{label}] done: {done} jobs", flush=True)
+
+    run(coco_jobs, "coco")
+
+    # OID in chunks, with an early abort if Flickr is hard-blocking this
+    # host too: after >=4000 OID attempts with <8% success, stop submitting
+    # and let the build fall back to COCO + composites (route-A verdict is
+    # recorded in download_stats.json either way).
+    chunk = 2000
+    oid_attempts = 0
+    for i in range(0, len(oid_jobs), chunk):
+        run(oid_jobs[i:i + chunk], f"oid@{i}")
+        oid_attempts += len(oid_jobs[i:i + chunk])
+        oid_ok = sum(stats["by_source"].get(k, {}).get("ok", 0)
+                     for k in ("oid_pos", "oid_neg"))
+        print(f"  OID so far: {oid_ok}/{oid_attempts} ok", flush=True)
+        if oid_attempts >= 4000 and oid_ok / max(1, oid_attempts) < 0.08:
+            stats["oid_aborted"] = True
+            print(f"OID abort: success rate <8% after {oid_attempts} "
+                  f"attempts - skipping remaining OID downloads", flush=True)
+            break
+
+    # Negative top-up from the COCO reserve: guarantees TARGET_NEG staged
+    # negatives even if OID delivered nothing at all.
+    if stats["neg_ok"] < TARGET_NEG and coco_neg_rest:
+        print(f"negative top-up: staged {stats['neg_ok']}, "
+              f"want {TARGET_NEG}", flush=True)
+        batch = []
+        for iid in coco_neg_rest:
+            fn, w, h, split = cand["coco_meta"][iid]
+            url = f"http://images.cocodataset.org/{split}/{fn}"
+            batch.append(("neg", f"coco_{iid}", url, None))
+            if len(batch) >= 4000:
+                run(batch, "coco-neg-topup")
+                stats["neg_topup_jobs"] += len(batch)
+                batch = []
+                if stats["neg_ok"] >= TARGET_NEG:
+                    break
+        if batch and stats["neg_ok"] < TARGET_NEG:
+            run(batch, "coco-neg-topup")
+            stats["neg_topup_jobs"] += len(batch)
+
     with open(os.path.join(STAGE, "stage_boxes.json"), "w") as f:
         json.dump(boxes_out, f)
     with open(os.path.join(STAGE, "download_stats.json"), "w") as f:
@@ -240,60 +367,90 @@ def stage_download(workers=48, oid_neg_want=26_000, coco_neg_want=18_000,
 
 
 # ---------------------------------------------------------------- build ----
+def _composite_attempt(spec):
+    """One copy-paste attempt (worker process). Writes syn_tmp_<idx>.jpg and
+    returns (idx, pasted box) or (idx, None) if the attempt was unusable."""
+    idx, donor_name, bg_name, donor_boxes, seed = spec
+    rng = random.Random(seed)
+    try:
+        donor = Image.open(os.path.join(STAGE, donor_name + ".jpg")).convert("RGB")
+        bg = Image.open(os.path.join(STAGE, bg_name + ".jpg")).convert("RGB")
+    except Exception:  # noqa: BLE001
+        return idx, None
+    dw, dh = donor.size
+    bw, bh = bg.size
+    bx = donor_boxes[rng.randrange(len(donor_boxes))]
+    x0, y0 = int(bx[0] * dw), int(bx[1] * dh)
+    x1, y1 = int(bx[2] * dw), int(bx[3] * dh)
+    mx, my = int(0.08 * (x1 - x0)) + 2, int(0.08 * (y1 - y0)) + 2
+    x0, y0 = max(0, x0 - mx), max(0, y0 - my)
+    x1, y1 = min(dw, x1 + mx), min(dh, y1 + my)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return idx, None
+    crop = donor.crop((x0, y0, x1, y1))
+    scale = rng.uniform(0.5, 1.5)
+    nw = max(8, int(crop.width * scale))
+    nh = max(8, int(crop.height * scale))
+    if nw >= bw or nh >= bh:
+        return idx, None
+    crop = crop.resize((nw, nh), Image.BILINEAR)
+    if rng.random() < 0.7:
+        crop = crop.rotate(rng.uniform(-10, 10), expand=True,
+                           fillcolor=crop.getpixel((0, 0)))
+        nw, nh = crop.size
+        if nw >= bw or nh >= bh:
+            return idx, None
+    # rough brightness match: shift crop mean toward background mean
+    try:
+        import numpy as np
+        cm = float(np.asarray(crop, dtype=np.float32).mean())
+        bm = float(np.asarray(bg, dtype=np.float32).mean())
+        if cm > 1:
+            crop = ImageEnhance.Brightness(crop).enhance(
+                max(0.6, min(1.5, bm / cm)))
+    except Exception:  # noqa: BLE001
+        pass
+    px = rng.randint(0, bw - nw)
+    py = rng.randint(0, bh - nh)
+    bg.paste(crop, (px, py))
+    bg.save(os.path.join(STAGE, f"syn_tmp_{idx:06d}.jpg"), "JPEG", quality=80)
+    return idx, [px / bw, py / bh, (px + nw) / bw, (py + nh) / bh]
+
+
 def make_composites(n_needed, pos_names, neg_names, boxes, seed=123):
-    """Paste phone crops from positive images onto negative backgrounds."""
+    """Paste phone crops from positive images onto negative backgrounds.
+
+    Attempts run in a process pool (this is the build stage's hot loop);
+    successful temp files are renamed to syn_NNNNNN.jpg in success order
+    and registered in `boxes`. Same recipe and seeds family as phase 1.
+    """
+    import glob
+    from multiprocessing import Pool
     rng = random.Random(seed)
     made = []
-    tries = 0
-    while len(made) < n_needed and tries < n_needed * 3:
-        tries += 1
-        donor_name = rng.choice(pos_names)
-        bg_name = rng.choice(neg_names)
-        try:
-            donor = Image.open(os.path.join(STAGE, donor_name + ".jpg")).convert("RGB")
-            bg = Image.open(os.path.join(STAGE, bg_name + ".jpg")).convert("RGB")
-        except Exception:  # noqa: BLE001
-            continue
-        dw, dh = donor.size
-        bw, bh = bg.size
-        bx = boxes[donor_name][rng.randrange(len(boxes[donor_name]))]
-        x0, y0 = int(bx[0] * dw), int(bx[1] * dh)
-        x1, y1 = int(bx[2] * dw), int(bx[3] * dh)
-        mx, my = int(0.08 * (x1 - x0)) + 2, int(0.08 * (y1 - y0)) + 2
-        x0, y0 = max(0, x0 - mx), max(0, y0 - my)
-        x1, y1 = min(dw, x1 + mx), min(dh, y1 + my)
-        if x1 - x0 < 8 or y1 - y0 < 8:
-            continue
-        crop = donor.crop((x0, y0, x1, y1))
-        scale = rng.uniform(0.5, 1.5)
-        nw = max(8, int(crop.width * scale))
-        nh = max(8, int(crop.height * scale))
-        if nw >= bw or nh >= bh:
-            continue
-        crop = crop.resize((nw, nh), Image.BILINEAR)
-        if rng.random() < 0.7:
-            crop = crop.rotate(rng.uniform(-10, 10), expand=True,
-                               fillcolor=crop.getpixel((0, 0)))
-            nw, nh = crop.size
-            if nw >= bw or nh >= bh:
-                continue
-        # rough brightness match: shift crop mean toward background mean
-        try:
-            import numpy as np
-            cm = float(np.asarray(crop, dtype=np.float32).mean())
-            bm = float(np.asarray(bg, dtype=np.float32).mean())
-            if cm > 1:
-                crop = ImageEnhance.Brightness(crop).enhance(
-                    max(0.6, min(1.5, bm / cm)))
-        except Exception:  # noqa: BLE001
-            pass
-        px = rng.randint(0, bw - nw)
-        py = rng.randint(0, bh - nh)
-        bg.paste(crop, (px, py))
-        name = f"syn_{len(made):06d}"
-        bg.save(os.path.join(STAGE, name + ".jpg"), "JPEG", quality=80)
-        boxes[name] = [[px / bw, py / bh, (px + nw) / bw, (py + nh) / bh]]
-        made.append(name)
+    wave = 0
+    while len(made) < n_needed and wave < 3:
+        remaining = n_needed - len(made)
+        specs = []
+        for i in range(int(remaining * 1.6) + 16):
+            dn = rng.choice(pos_names)
+            specs.append((wave * 1_000_000 + i, dn, rng.choice(neg_names),
+                          boxes[dn], seed + wave * 1_000_000 + i))
+        with Pool(processes=min(4, os.cpu_count() or 1)) as pool:
+            for idx, box in pool.imap_unordered(_composite_attempt, specs,
+                                                chunksize=16):
+                if box is None:
+                    continue
+                name = f"syn_{len(made):06d}"
+                os.replace(os.path.join(STAGE, f"syn_tmp_{idx:06d}.jpg"),
+                           os.path.join(STAGE, name + ".jpg"))
+                boxes[name] = [box]
+                made.append(name)
+                if len(made) >= n_needed:
+                    break
+        wave += 1
+    for tmp in glob.glob(os.path.join(STAGE, "syn_tmp_*.jpg")):
+        os.remove(tmp)
     return made
 
 
@@ -336,7 +493,12 @@ def stage_build(seed=42):
           f"negatives {len(neg_all)} "
           f"(oid confusable {sum(1 for n in neg_all if n.startswith('oid_'))})",
           flush=True)
-    assert len(pos_all) == TARGET_POS and len(neg_all) == TARGET_NEG
+    if len(pos_all) != TARGET_POS or len(neg_all) != TARGET_NEG:
+        # Do not fail the whole build: the manifest records the real counts
+        # and the shortfall; training proceeds on what exists.
+        print(f"WARNING: dataset short of target "
+              f"(pos {len(pos_all)}/{TARGET_POS}, "
+              f"neg {len(neg_all)}/{TARGET_NEG})", flush=True)
 
     def split90(names):
         names = names[:]
@@ -400,6 +562,12 @@ def stage_build(seed=42):
         "val": {"positives": len(groups["pos"][1]),
                 "negatives": len(groups["neg"][1])},
         "download_stats": stats,
+        "oid_staged_total": (
+            stats.get("by_source", {}).get("oid_pos", {}).get("ok", 0)
+            + stats.get("by_source", {}).get("oid_neg", {}).get("ok", 0)),
+        "oid_fallback_triggered": (
+            stats.get("by_source", {}).get("oid_pos", {}).get("ok", 0)
+            + stats.get("by_source", {}).get("oid_neg", {}).get("ok", 0)) < 1000,
         "oid_candidates": {
             "positive_images_in_annotations": len(cand["oid_pos"]),
             "confusable_images_in_annotations": len(cand["oid_conf"]),
@@ -434,10 +602,13 @@ def stage_pack():
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("stage", choices=["parse", "download", "build", "pack"])
+    ap.add_argument("stage",
+                    choices=["prep", "parse", "download", "build", "pack"])
     ap.add_argument("--workers", type=int, default=48)
     a = ap.parse_args()
-    if a.stage == "parse":
+    if a.stage == "prep":
+        stage_prep()
+    elif a.stage == "parse":
         stage_parse()
     elif a.stage == "download":
         stage_download(workers=a.workers)

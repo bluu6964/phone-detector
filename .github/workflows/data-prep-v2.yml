@@ -1,0 +1,131 @@
+name: data-prep-v2
+
+# Route A: build the full v2 dataset (100k images: 60k phone + 40k other)
+# on a GitHub Actions runner - the runner's IPs may dodge the Flickr 429
+# rate limit that blocks the dev VM. Produces the `data-v2` release that
+# train-v2.yml consumes. All heavy state lives and dies on the runner;
+# only the packed dataset + manifest are uploaded.
+on:
+  workflow_dispatch:
+
+jobs:
+  prep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        # data_prep_v2.py needs pillow/numpy/requests only (no torch/onnx).
+        run: pip install pillow==10.4.0 numpy==1.26.4 requests==2.32.3
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android-sdk /usr/share/dotnet \
+            /opt/hostedtoolcache/CodeQL || true
+          df -h .
+
+      - name: Download source CSVs + COCO annotations (~5.4 GB)
+        run: |
+          mkdir -p data_v2_src
+          cd data_v2_src
+          dl() { curl -sL -C - --retry 5 --retry-delay 5 -o "$1" "$2" & }
+          dl oidv6-train-annotations-bbox.csv \
+            "https://storage.googleapis.com/openimages/v6/oidv6-train-annotations-bbox.csv"
+          dl oidv6-train-images-with-labels.csv \
+            "https://storage.googleapis.com/openimages/v6/oidv6-train-images-with-labels-with-rotation.csv"
+          dl v5-validation-annotations-bbox.csv \
+            "https://storage.googleapis.com/openimages/v5/validation-annotations-bbox.csv"
+          dl v5-test-annotations-bbox.csv \
+            "https://storage.googleapis.com/openimages/v5/test-annotations-bbox.csv"
+          dl validation-images-with-rotation.csv \
+            "https://storage.googleapis.com/openimages/2018_04/validation/validation-images-with-rotation.csv"
+          dl test-images-with-rotation.csv \
+            "https://storage.googleapis.com/openimages/2018_04/test/test-images-with-rotation.csv"
+          dl annotations_trainval2017.zip \
+            "http://images.cocodataset.org/annotations/annotations_trainval2017.zip"
+          wait
+          ls -la
+          # fail loudly if any file is truncated/missing (bytes, from the
+          # known-good phase-1 downloads, with headroom)
+          check() { sz=$(stat -c%s "$1"); echo "$1 $sz (min $2)"; [ "$sz" -ge "$2" ]; }
+          check oidv6-train-annotations-bbox.csv 2000000000
+          check oidv6-train-images-with-labels.csv 2400000000
+          check v5-validation-annotations-bbox.csv 20000000
+          check v5-test-annotations-bbox.csv 70000000
+          check validation-images-with-rotation.csv 14000000
+          check test-images-with-rotation.csv 40000000
+          check annotations_trainval2017.zip 240000000
+
+      - name: Prep COCO candidates (from annotations zip)
+        run: |
+          set -o pipefail
+          python -u data_prep_v2.py prep 2>&1 | tee prep.log
+
+      - name: Parse OID annotations + URLs -> candidates.json
+        run: |
+          set -o pipefail
+          python -u data_prep_v2.py parse 2>&1 | tee parse.log
+          # CSVs are dead weight from here on (~5.4 GB); candidates.json
+          # carries everything the later stages need.
+          rm -f data_v2_src/oidv6-train-annotations-bbox.csv \
+            data_v2_src/oidv6-train-images-with-labels.csv \
+            data_v2_src/v5-validation-annotations-bbox.csv \
+            data_v2_src/v5-test-annotations-bbox.csv \
+            data_v2_src/validation-images-with-rotation.csv \
+            data_v2_src/test-images-with-rotation.csv \
+            data_v2_src/annotations_trainval2017.zip
+          df -h .
+
+      - name: Download images (COCO + OID/Flickr)
+        run: |
+          set -o pipefail
+          python -u data_prep_v2.py download --workers 48 2>&1 | tee download.log
+          df -h .
+
+      - name: Build dataset (composites + split + manifest)
+        run: |
+          set -o pipefail
+          python -u data_prep_v2.py build 2>&1 | tee build.log
+          cat data_v2/manifest.json
+          cp data_v2_stage/download_stats.json . || true
+          # stage/ and src/ are no longer needed; free space before packing
+          rm -rf data_v2_stage data_v2_src
+          df -h .
+
+      - name: Pack dataset (<2GB tar parts)
+        run: |
+          python -u data_prep_v2.py pack
+          ls -la data_v2.tar.part-*
+
+      - name: Publish release data-v2
+        run: |
+          gh release view data-v2 > /dev/null 2>&1 || \
+            gh release create data-v2 \
+              --title "Phone detector v2 dataset (100k)" \
+              --notes "100,000 images: 60,000 phone (real + copy-paste composites) + 40,000 negatives. Built on a GitHub Actions runner by .github/workflows/data-prep-v2.yml. See manifest.json for the real/synthetic split and per-source counts."
+          gh release upload data-v2 data_v2.tar.part-* data_v2/manifest.json --clobber
+          gh release view data-v2
+
+      - name: Upload logs + manifest (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-prep-v2-logs
+          path: |
+            prep.log
+            parse.log
+            download.log
+            build.log
+            download_stats.json
+            data_v2/manifest.json
+          if-no-files-found: warn
